@@ -1,0 +1,581 @@
+//@version=5
+//@strategy_alert_message {{strategy.order.alert_message}}
+import dokang/POA/10 as POA
+strategy("라오어 무한매수법 V3.2", initial_capital = 10000, overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=10, process_orders_on_close = true)
+
+// 자동매매 기본 설정
+password = "0414Dlrlfwn"
+start_time = input.time(timestamp("2023-04-01T00:00:00+09:00"), title="자동매매 시작")  // 시작 날짜를 과거로 수정
+end_time = input.time(timestamp("2030-01-01T00:00:00+09:00"), title="자동매매 종료")
+pstrategy = POA.bot.new(password, start_time, end_time, leverage = 1, kis_number = 2)
+in_trade = POA.in_trade(start_time, end_time)
+
+
+// V3.0 기본 파라미터
+initial_capital = input.float(defval=10000, title="초기 투자금", step=1000)
+divisions = input.int(defval=50, title="분할 횟수", step=1, minval=10)
+take_profit_percentage = input.float(defval=20, title="목표 수익률(%)", step=1, minval=5)
+quarter_sell_enabled = input.bool(defval=true, title="쿼터매도 활성화")
+repeat_profit_percentage = input.float(defval=100, title="반복리 비율 (%)", step=10, minval=0, maxval=100, tooltip="수익의 몇 %를 다음 사이클에 추가할지")
+
+// 별% 계산을 위한 설정
+star_base = input.float(defval=20, title="별% 기본값", step=1, minval=5)
+star_decrement = star_base / (divisions * 0.95)
+
+// 추가 매수 조건 설정
+use_stop_loss = input.bool(defval=false, title="손절매 사용")
+stop_loss_percentage = input.float(defval=50, title="손절매 비율 (%)", step=5, minval=10)
+
+// 트레일링 스탑 설정
+use_trailing_stop = input.bool(defval=false, title="트레일링 스탑 사용")
+trailing_stop_percentage = input.float(defval=3, title="트레일링 스탑 되돌림 비율 (%)", step=0.5, minval=0.5)
+sell_percentage = input.float(defval=100, title="트레일링 스탑 시 매도 비율 (%)", step=10, minval=10, maxval=100)
+
+// 시간 조건 설정 (장중 매수 + LOC)
+is_market_hours = not na(time("1", "0930-1540", "America/New_York"))
+is_loc_time = not na(time("1", "1540-1600", "America/New_York"))
+
+// 상태 관리를 위한 변수들
+var float total_invested = 0.0
+var float total_shares = 0.0
+var float avg_price = 0.0
+var int buy_count = 0
+var float initial_buy_price = 0.0
+var float target_sell_price = 0.0
+var int last_intraday_buy_date = 0
+var int last_loc_buy_date = 0
+var float realized_profit = 0.0
+var float per_division_amount_initial = 0.0
+var bool quarter_sold = false
+var float star_percentage = 0.0
+var int quarter_cycle_count = 0
+var int last_quarter_sell_date = 0
+var bool trailing_activated = false
+var float highest_price_since_target = 0.0
+var float trailing_stop_price = 0.0
+var float loc_buy_price_star = 0.0
+var float quarter_sell_price = 0.0
+var float accumulated_profit = 0.0
+var bool prev_is_first_half = na
+var bool is_rear_half_sold_today = false
+var bool is_final_round = false
+var int whole_cycle_count = 0
+var float loc_buy_price_avg = 0.0
+// 조건 감지 변수들 (기본값 초기화)
+var bool loc_buy_triggered = false
+var bool star_loc_buy_triggered = false
+var bool avg_loc_buy_triggered = false
+var bool quarter_sell_triggered = false
+var bool rear_half_sell_triggered = false
+var bool take_profit_hit = false
+var bool trailing_activated_trigger = false
+var bool trailing_stop_hit = false
+var bool stop_loss_hit = false
+var float fund_based_progress = 0.0
+var bool fund_based_moc_sell_triggered = false
+var int fund_adjusted_count = 0  // 자금 기반 조정 횟수
+var string cycle_start_date = ""  // 현재 사이클 시작 일자
+var float remaining_division_budget = 0.0
+
+// 최소한의 필수 계산 (in_trade 여부와 상관없이 필요)
+current_day = dayofweek
+half_threshold = math.round(divisions * 0.5)
+progress_rate = math.min(buy_count / divisions * 100, 100)
+is_first_half = buy_count <= half_threshold
+is_rear_half_special = buy_count > half_threshold and buy_count < divisions
+
+// 평균 단가 계산 함수
+calculate_avg_price(current_avg, current_shares, new_price, new_shares) => 
+    (current_avg * current_shares + new_price * new_shares) / (current_shares + new_shares)
+
+// 주식 수량 계산 함수 수정 (소수점 대신 정수 주식 수량 반환)
+calculate_shares(amount, price, remaining_budget) =>
+    // 살 수 있는 최대 주식 수 계산
+    max_shares = math.floor(amount / price)
+    
+    // 남는 금액 계산
+    remainder = amount - (max_shares * price)
+    
+    // 만약 남는 금액이 주식 가격의 70% 이상이고, 추가 1주를 사도 남은 예산을 초과하지 않는다면 한 주 더 구매
+    if remainder >= price * 0.8 and price <= remaining_budget
+        max_shares := max_shares + 1
+    
+    max_shares
+
+// 별% 계산 함수
+calculate_star_percentage(t) =>
+    star_base - ((t / divisions) * star_base * 2)
+
+// in_trade 시간 내에만 핵심 로직 실행
+if in_trade
+    // 새로운 거래일 시작 시 후반전 매도 상태 리셋
+    if ta.change(dayofweek)
+        is_rear_half_sold_today := false
+    
+    // 1회 매수금 계산 (반복리 적용)
+    if buy_count == 0
+        per_division_amount_initial := (initial_capital + accumulated_profit) / divisions
+        is_rear_half_sold_today := false  // 초기화
+        remaining_division_budget := per_division_amount_initial
+    
+    // 현재 1회 매수금
+    per_division_amount = per_division_amount_initial
+    
+    // 별% 계산
+    star_percentage := calculate_star_percentage(buy_count)
+    
+    // 매수/매도 가격 계산
+    loc_buy_price_star := avg_price * (1 + star_percentage / 100)
+    
+    // 쿼터매도 기준가 계산
+    if is_first_half
+        quarter_sell_price := avg_price * (1 + star_percentage / 100)
+    else
+        quarter_sell_price := avg_price * (1 - star_percentage / 100)
+    
+    // 평단 LOC
+    loc_buy_price_avg := avg_price
+    
+    // 목표가 계산
+    target_sell_price := avg_price * (1 + take_profit_percentage / 100)
+    
+    // LOC 매수 조건 설정
+    if is_loc_time and buy_count < divisions and current_day != last_loc_buy_date
+        // 후반전 특수 구간에서 당일 매도 발생 시 매수 중단
+        if is_rear_half_special and is_rear_half_sold_today
+            star_loc_buy_triggered := false
+            avg_loc_buy_triggered := false
+        else if buy_count == 0
+            // 첫 회엔 무조건 별% 전량
+            star_loc_buy_triggered := true
+            avg_loc_buy_triggered := false
+        else if is_first_half
+            // 전반전일 때 두 가지 조건을 독립적으로 판단
+            star_loc_buy_triggered := (close <= loc_buy_price_star)
+            avg_loc_buy_triggered := (close <= loc_buy_price_avg)
+        else
+            // 후반전엔 평단매수 없음
+            star_loc_buy_triggered := (close <= loc_buy_price_star)
+            avg_loc_buy_triggered := false
+        
+        loc_buy_triggered := star_loc_buy_triggered or avg_loc_buy_triggered
+    else
+        // LOC 시간이 아니면 신호 비활성화
+        star_loc_buy_triggered := false
+        avg_loc_buy_triggered := false
+        loc_buy_triggered := false
+    
+    // 매매 실행 로직
+    if not trailing_activated
+        if is_final_round and quarter_sell_enabled and not quarter_sold and strategy.position_size > 0 and is_loc_time
+            quarter_shares = math.round(strategy.position_size / 4)
+            strategy.order("Max T 쿼터매도", strategy.short, qty=quarter_shares, alert_message=POA.entry_message(password, kis_number=2))
+            sold_value = close * quarter_shares
+            sell_cost = total_invested * (quarter_shares / strategy.position_size)
+            realized_profit += sold_value - sell_cost
+            total_invested -= sell_cost
+            total_shares -= quarter_shares
+            quarter_sold := true
+            last_quarter_sell_date := current_day
+            buy_count := math.round(buy_count * (1 - (sell_cost / total_invested)))
+            fund_adjusted_count := fund_adjusted_count + 1
+
+        
+        // 전반전 1/4 쿼터매도 조건
+        quarter_sell_triggered := is_first_half and quarter_sell_enabled and not quarter_sold and strategy.position_size > 0 and close >= quarter_sell_price and is_loc_time
+        
+        // 후반전 매도 조건
+        rear_half_sell_triggered := 
+         not is_first_half and quarter_sell_enabled and not quarter_sold and strategy.position_size > 0 and (close >= loc_buy_price_star or close >= quarter_sell_price) and is_loc_time
+         
+        
+        // 전반전에는 절반씩 매수, 후반전에는 별% LOC로 전량 매수
+        half_amount = per_division_amount / 2
+        half_shares = half_amount / close
+        full_shares = per_division_amount / close
+        
+        // LOC 매수 처리
+        if loc_buy_triggered and is_loc_time
+            if is_first_half 
+                // 전반전: 별% LOC 매수 (반)
+                if star_loc_buy_triggered
+                    actual_half_shares = calculate_shares(half_amount, close, remaining_division_budget)
+                    actual_half_cost = actual_half_shares * close
+
+                    strategy.order("별% LOC #"+str.tostring(buy_count+1), strategy.long, qty=actual_half_shares, alert_message=POA.entry_message(password, kis_number=2))
+                    avg_price := calculate_avg_price(avg_price, total_shares, close, actual_half_shares)
+                    total_invested += actual_half_cost
+                    total_shares += actual_half_shares
+                    buy_count += 1
+                    quarter_sold := false
+                
+                // 평단 LOC 매수 (반)
+                if avg_loc_buy_triggered
+                    actual_half_shares = calculate_shares(half_amount, close, remaining_division_budget)
+                    actual_half_cost = actual_half_shares * close
+
+                    strategy.order("평단 LOC #"+str.tostring(buy_count)+".5", strategy.long, qty=actual_half_shares, alert_message=POA.entry_message(password, kis_number=2))
+                    avg_price := calculate_avg_price(avg_price, total_shares, close, actual_half_shares)
+                    total_invested += actual_half_cost
+                    total_shares += actual_half_shares
+            else
+                // 후반전: 별% LOC 매수 (전량)
+                if star_loc_buy_triggered
+                    actual_full_shares = calculate_shares(per_division_amount, close, remaining_division_budget)
+                    actual_full_cost = actual_full_shares * close
+                                        
+                    strategy.order("별% LOC #"+str.tostring(buy_count+1), strategy.long, qty=actual_full_shares, alert_message=POA.entry_message(password, kis_number=2))
+                    avg_price := calculate_avg_price(avg_price, total_shares, close, actual_full_shares)
+                    total_invested += actual_full_cost
+                    total_shares += actual_full_shares
+                    buy_count += 1
+                    quarter_sold := false
+            
+            last_loc_buy_date := current_day
+        
+        // 전반전 1/4 쿼터매도 실행
+        if quarter_sell_triggered
+            quarter_shares = math.round(strategy.position_size / 4)
+            strategy.order("전반전 쿼터매도", strategy.short, qty=quarter_shares, alert_message=POA.entry_message(password, kis_number=2))
+            // 수정된 손익 계산
+            sold_value = close * quarter_shares
+            buy_cost_per_share = avg_price  // 평균 매수가 사용
+            sell_cost = buy_cost_per_share * quarter_shares
+            profit_or_loss = sold_value - sell_cost
+            
+            // 수익이 맞는지 한번 더 확인
+            if profit_or_loss > 0
+                profit_to_add = profit_or_loss * (repeat_profit_percentage / 100)
+                accumulated_profit := accumulated_profit + profit_to_add
+                per_division_amount_initial := (initial_capital + accumulated_profit) / divisions
+
+                realized_profit += profit_or_loss
+                total_invested -= sell_cost
+                total_shares -= quarter_shares
+                quarter_sold := true
+                last_quarter_sell_date := current_day
+                buy_count := math.round(buy_count * (1 - (sell_cost / total_invested)))
+            fund_adjusted_count := fund_adjusted_count + 1
+
+
+                
+        // 후반전 매도 실행
+        if rear_half_sell_triggered
+            quarter_shares = math.round(strategy.position_size / 4)
+            // 수정된 손익 계산
+            sold_value = close * quarter_shares
+            buy_cost_per_share = avg_price  // 평균 매수가 사용
+            sell_cost = buy_cost_per_share * quarter_shares
+            profit_or_loss = sold_value - sell_cost
+
+            strategy.order("후반전 쿼터매도", strategy.short, qty=quarter_shares, alert_message=POA.entry_message(password, kis_number=2))
+            realized_profit += profit_or_loss  // 손익 반영
+
+            // 수익인 경우에만 반복리 추가
+            if profit_or_loss > 0
+                profit_to_add = profit_or_loss * (repeat_profit_percentage / 100)
+                accumulated_profit := accumulated_profit + profit_to_add
+                per_division_amount_initial := (initial_capital + accumulated_profit) / divisions
+
+            total_invested -= sell_cost
+            total_shares -= quarter_shares
+            quarter_sold := true
+            last_quarter_sell_date := current_day
+            buy_count := math.round(buy_count * (1 - (sell_cost / total_invested)))
+            is_rear_half_sold_today := true
+            fund_adjusted_count := fund_adjusted_count + 1
+
+        fund_based_progress := (total_invested / (initial_capital + accumulated_profit)) * 100
+
+        fund_based_moc_sell_triggered := fund_based_progress >= 99 and strategy.position_size > 0 and is_loc_time and not quarter_sold
+
+        if fund_based_moc_sell_triggered
+            quarter_shares = math.round(strategy.position_size / 4)
+            strategy.order("자금기반 MOC 쿼터매도", strategy.short, qty=quarter_shares, alert_message=POA.entry_message(password, kis_number=2))
+            sold_value = close * quarter_shares
+            sell_cost = total_invested * (quarter_shares / strategy.position_size)
+            realized_profit += sold_value - sell_cost
+            total_invested -= sell_cost
+            total_shares -= quarter_shares
+            quarter_sold := true
+            last_quarter_sell_date := current_day
+            fund_adjusted_count := fund_adjusted_count + 1
+            buy_count := math.round(buy_count * (1 - (sell_cost / total_invested)))
+
+        
+        // 최종 회차 도달 여부 확인
+        is_final_round := buy_count >= divisions - 1
+        
+        // 목표가 도달 시 트레일링 스탑 활성화
+        trailing_activated_trigger := not trailing_activated and strategy.position_size > 0 and high >= target_sell_price and use_trailing_stop
+        
+        if trailing_activated_trigger
+            trailing_activated := true
+            highest_price_since_target := high
+            trailing_stop_price := high * (1 - trailing_stop_percentage / 100)
+        
+        // 목표가 도달 시 바로 매도 (트레일링 스탑 미사용 시)
+        take_profit_hit := not use_trailing_stop and strategy.position_size > 0 and high >= target_sell_price
+        
+        if take_profit_hit
+            // 익절 시 실현 이익 계산 및 추가
+            current_value = target_sell_price * total_shares
+            exit_profit = current_value - total_invested
+            realized_profit := realized_profit + exit_profit
+            
+            strategy.close_all("익절 @ " + str.tostring(target_sell_price), alert_message=POA.entry_message(password, kis_number=2))
+            
+            // 반복리 계산
+            if exit_profit > 0
+                profit_to_add = exit_profit * (repeat_profit_percentage / 100)
+                accumulated_profit := accumulated_profit + profit_to_add
+                per_division_amount_initial := (initial_capital + accumulated_profit) / divisions
+            
+            // 변수 초기화
+            total_invested := 0.0
+            total_shares := 0.0
+            avg_price := 0.0
+            buy_count := 0
+            target_sell_price := 0.0
+            last_intraday_buy_date := 0
+            last_loc_buy_date := 0
+            quarter_sold := false
+            star_percentage := calculate_star_percentage(0)
+            quarter_cycle_count := 0
+            last_quarter_sell_date := 0
+            is_rear_half_sold_today := false
+            whole_cycle_count := whole_cycle_count + 1
+            cycle_start_date := str.format("{0}/{1}/{2}", year, month, dayofmonth)
+            fund_adjusted_count := 0
+
+
+        // 손절 조건 체크
+        stop_loss_hit := use_stop_loss and not trailing_activated and strategy.position_size > 0 and low <= initial_buy_price * (1 - stop_loss_percentage/100)
+        
+        if stop_loss_hit
+            // 손절 실행
+            stop_price = initial_buy_price * (1 - stop_loss_percentage/100)
+            current_value = stop_price * total_shares
+            exit_loss = current_value - total_invested
+            realized_profit := realized_profit + exit_loss
+            
+            strategy.close_all("손절 @ " + str.tostring(initial_buy_price * (1 - stop_loss_percentage/100)), 
+             alert_message=POA.entry_message(password, kis_number=2))
+            
+            // 변수 초기화
+            total_invested := 0.0
+            total_shares := 0.0
+            avg_price := 0.0
+            buy_count := 0
+            target_sell_price := 0.0
+            last_intraday_buy_date := 0
+            last_loc_buy_date := 0
+            trailing_activated := false
+            highest_price_since_target := 0.0
+            trailing_stop_price := 0.0
+            quarter_sold := false
+            star_percentage := calculate_star_percentage(0)
+            is_rear_half_sold_today := false
+    else
+        // 트레일링 스탑 로직
+        if high > highest_price_since_target
+            highest_price_since_target := high
+            trailing_stop_price := high * (1 - trailing_stop_percentage / 100)
+        
+        // 트레일링 스탑 실행
+        trailing_stop_hit := strategy.position_size > 0 and low <= trailing_stop_price
+        
+        if trailing_stop_hit
+            // 판매할 주식 수량 계산
+            sell_shares = strategy.position_size * (sell_percentage / 100)
+            
+            // 실현 이익 계산
+            sell_value = trailing_stop_price * sell_shares
+            sell_cost = total_invested * (sell_percentage / 100)
+            exit_profit = sell_value - sell_cost
+            realized_profit := realized_profit + exit_profit
+            
+            // 트레일링 스탑으로 매도
+            if sell_percentage == 100
+                strategy.close_all("트레일링 스탑 @ " + str.tostring(trailing_stop_price), 
+                 alert_message=POA.entry_message(password, kis_number=2))
+                
+                // 반복리 계산
+                if exit_profit > 0
+                    profit_to_add = exit_profit * (repeat_profit_percentage / 100)
+                    accumulated_profit := accumulated_profit + profit_to_add
+                    per_division_amount_initial := per_division_amount_initial + (profit_to_add / divisions)
+                
+                // 변수 초기화
+                total_invested := 0.0
+                total_shares := 0.0
+                avg_price := 0.0
+                buy_count := 0
+                target_sell_price := 0.0
+                last_intraday_buy_date := 0
+                last_loc_buy_date := 0
+                trailing_activated := false
+                highest_price_since_target := 0.0
+                trailing_stop_price := 0.0
+                quarter_sold := false
+                star_percentage := calculate_star_percentage(0)
+                quarter_cycle_count := 0    
+                last_quarter_sell_date := 0
+                is_rear_half_sold_today := false                
+            else
+                // 일부만 매도
+                strategy.order("트레일링 스탑 일부매도", strategy.short, qty=sell_shares, 
+                 alert_message=POA.entry_message(password, kis_number=2))
+                // 변수 업데이트
+                total_invested := total_invested - sell_cost
+                total_shares := total_shares - sell_shares
+                trailing_activated := false
+                highest_price_since_target := 0.0
+                trailing_stop_price := 0.0
+    
+    // 상태 업데이트
+    prev_is_first_half := is_first_half
+else
+    // in_trade가 아닐 때는 최소한의 작업만 수행
+    // 모든 트리거 변수 비활성화
+    loc_buy_triggered := false
+    star_loc_buy_triggered := false
+    avg_loc_buy_triggered := false
+    quarter_sell_triggered := false
+    rear_half_sell_triggered := false
+    take_profit_hit := false
+    trailing_activated_trigger := false
+    trailing_stop_hit := false
+    stop_loss_hit := false
+
+// 전반전/후반전 배경색 표시
+bgcolor(is_first_half ? color.new(color.green, 95) : color.new(color.red, 95))
+
+// 시각화 - 필요한 경우에만 그리기
+
+plot(avg_price, color=color.yellow, title="평균 매수가", linewidth=2, style=plot.style_linebr)
+plot(target_sell_price, color=color.green, title="목표 매도가", linewidth=2, style=plot.style_linebr)
+plot(quarter_sell_price, color=color.orange, title="쿼터매도 가격", linewidth=2, style=plot.style_linebr)
+plot(loc_buy_price_star, color=color.purple, title="별% 매수 가격", linewidth=2, style=plot.style_linebr)
+plot(loc_buy_price_avg, color=color.blue, title="평단 매수 가격", linewidth=2, style=plot.style_linebr)
+plot(initial_buy_price * (1 - stop_loss_percentage/100), color=color.red, title="손절가", linewidth=2, style=plot.style_linebr)
+plot(trailing_stop_price, color=color.purple, title="트레일링 스탑 가격", linewidth=2, style=plot.style_linebr)
+
+// 매수/매도 지점 표시 - 크기를 large로 수정하고 눈에 띄는 색상 사용
+plotshape(star_loc_buy_triggered, title="별% LOC 매수", location=location.belowbar, color=color.fuchsia, style=shape.triangleup, size=size.tiny)
+plotshape(avg_loc_buy_triggered, title="평단 LOC 매수", location=location.belowbar, color=color.blue, style=shape.triangleup, size=size.tiny)
+plotshape(quarter_sell_triggered, title="전반전 쿼터매도", location=location.abovebar, color=color.orange, style=shape.triangledown, size=size.tiny)
+plotshape(rear_half_sell_triggered, title="후반전 매도", location=location.abovebar, color=color.fuchsia, style=shape.triangledown, size=size.tiny)
+plotshape(take_profit_hit, title="익절", location=location.abovebar, color=color.green, style=shape.triangledown, size=size.tiny)
+plotshape(trailing_activated_trigger, title="트레일링 활성화", location=location.abovebar, color=color.blue, style=shape.circle, size=size.tiny)
+plotshape(trailing_stop_hit, title="트레일링 스탑", location=location.abovebar, color=color.purple, style=shape.triangledown, size=size.tiny)
+plotshape(stop_loss_hit, title="손절", location=location.abovebar, color=color.red, style=shape.triangledown, size=size.tiny)
+
+// 테이블 생성 및 정보 표시
+var table infoTable = table.new(position.top_right, columns=2, rows=23, bgcolor=color.new(color.blue, 90), border_width=1)
+
+// 테이블 업데이트 함수
+updateInfoTable() =>
+    // 수익률 계산
+    current_value = close * total_shares
+    profit_amount = current_value - total_invested
+    profit_percentage = avg_price > 0 ? ((close - avg_price) / avg_price) * 100 : 0
+    
+    // 잔고 계산
+    current_cycle_initial_capital = initial_capital + accumulated_profit
+    balance = current_cycle_initial_capital - total_invested
+
+    // 테이블 내용 업데이트
+    table.cell(infoTable, 0, 0, "ETF", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 0, syminfo.tickerid, bgcolor=color.new(color.blue, 90), text_color=color.white)
+    
+    table.cell(infoTable, 0, 1, "진행률", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    progress_color = progress_rate >= 50 ? color.orange : color.white
+    table.cell(infoTable, 1, 1, str.tostring(math.round(progress_rate, 1)) + "%", bgcolor=color.new(color.blue, 90), text_color=progress_color)
+    
+    table.cell(infoTable, 0, 2, "회차(T)", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 2, str.tostring(buy_count) + "/" + str.tostring(divisions), bgcolor=color.new(color.blue, 90), text_color=color.white)
+    
+    table.cell(infoTable, 0, 3, "별%", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 3, str.tostring(math.round(star_percentage, 2)) + "%", bgcolor=color.new(color.blue, 90), text_color=color.white)
+       
+    table.cell(infoTable, 0, 4, "평균가", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 4, "$" + str.tostring(math.round(avg_price, 2)), bgcolor=color.new(color.blue, 90), text_color=color.white)
+    
+    table.cell(infoTable, 0, 5, "목표가", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 5, "$" + str.tostring(math.round(target_sell_price, 2)), bgcolor=color.new(color.blue, 90), text_color=color.white)
+    
+    table.cell(infoTable, 0, 6, "쿼터매도가", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 6, "$" + str.tostring(math.round(quarter_sell_price, 2)), bgcolor=color.new(color.blue, 90), text_color=color.white)
+    
+    // 자금 기반 조정 횟수 추가
+    table.cell(infoTable, 0, 7, "쿼터매도 횟수", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 7, str.tostring(fund_adjusted_count), bgcolor=color.new(color.blue, 90), text_color=color.yellow)
+    
+    table.cell(infoTable, 0, 8, "1회 매수금", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 8, "$" + str.tostring(math.round(per_division_amount_initial, 2)), bgcolor=color.new(color.blue, 90), text_color=color.white)
+    
+    table.cell(infoTable, 0, 9, "초기 투자금", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 9, "$" + str.tostring(math.round(initial_capital, 2)), bgcolor=color.new(color.blue, 90), text_color=color.white)
+    
+    table.cell(infoTable, 0, 10, "현재 사이클 초기 투자금", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 10, "$" + str.tostring(math.round(initial_capital + accumulated_profit, 2)), bgcolor=color.new(color.blue, 90), text_color=color.rgb(0, 245, 253))    
+
+    table.cell(infoTable, 0, 11, "현재 사이클 투자금", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 11, "$" + str.tostring(math.round(total_invested, 2)), bgcolor=color.new(color.blue, 90), text_color=color.lime)  
+
+    table.cell(infoTable, 0, 12, "잔고", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    balance_color = balance >= 0 ? color.green : color.red
+    table.cell(infoTable, 1, 12, "$" + str.tostring(math.round(balance, 2)), bgcolor=color.new(color.blue, 90), text_color=balance_color)
+
+    // 보유 주식 수량 표시 추가 (13번 행과 14번 행 사이에 삽입)
+    table.cell(infoTable, 0, 13, "보유 주식 수량", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 13, str.tostring(math.round(total_shares, 2)) + " 주", bgcolor=color.new(color.blue, 90), text_color=color.white)
+
+
+    table.cell(infoTable, 0, 14, "현재가치", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 14, "$" + str.tostring(math.round(current_value, 2)), bgcolor=color.new(color.blue, 90), text_color=color.white)
+    
+    table.cell(infoTable, 0, 15, "미실현 수익률", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    profit_color = profit_percentage >= 0 ? color.green : color.red
+    table.cell(infoTable, 1, 15, str.tostring(math.round(profit_percentage, 2)) + "%", bgcolor=color.new(color.blue, 90), text_color=profit_color)
+    
+    table.cell(infoTable, 0, 16, "실현 손익", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    realized_color = realized_profit >= 0 ? color.green : color.red
+    table.cell(infoTable, 1, 16, "$" + str.tostring(math.round(realized_profit, 2)), bgcolor=color.new(color.blue, 90), text_color=realized_color)
+    
+    table.cell(infoTable, 0, 17, "단계", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    phase_text = is_first_half ? "전반전" : "후반전"
+    phase_text_color = is_first_half ? color.yellow : color.orange
+    table.cell(infoTable, 1, 17, phase_text, bgcolor=color.new(color.blue, 90), text_color=phase_text_color)
+
+    table.cell(infoTable, 0, 18, "특수구간", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    special_text = is_rear_half_special ? "활성" : "비활성"
+    special_color = is_rear_half_special ? color.green : color.gray
+    table.cell(infoTable, 1, 18, special_text, bgcolor=color.new(color.blue, 90), text_color=special_color)
+
+    table.cell(infoTable, 0, 19, "누적 반복리", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 19, "$" + str.tostring(math.round(accumulated_profit, 2)), bgcolor=color.new(color.blue, 90), text_color=color.green)
+    
+    table.cell(infoTable, 0, 20, "전체 사이클 순환 횟수", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 20, str.tostring(whole_cycle_count), bgcolor=color.new(color.blue, 90), text_color=color.white)
+
+    table.cell(infoTable, 0, 21, "자금 기반 진행률", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 21, str.tostring(math.round(fund_based_progress, 1)) + "%", bgcolor=color.new(color.blue, 90), text_color=color.orange)
+    
+    // 현재 사이클 시작 일자 추가
+    table.cell(infoTable, 0, 22, "현재 사이클 시작 일자", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 22, cycle_start_date, bgcolor=color.new(color.blue, 90), text_color=color.rgb(255, 215, 0))
+// in_trade 여부와 상관없이 실행
+if in_trade
+    // in_trade 상태일 때만 테이블 업데이트
+    updateInfoTable()
+else
+    // 거래 시간이 아닐 때는 최소한의 정보만 표시
+    table.cell(infoTable, 0, 0, "ETF", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 0, syminfo.tickerid, bgcolor=color.new(color.blue, 90), text_color=color.white)
+    
+    table.cell(infoTable, 0, 1, "거래 시간", bgcolor=color.new(color.blue, 90), text_color=color.white)
+    table.cell(infoTable, 1, 1, "비활성", bgcolor=color.new(color.blue, 90), text_color=color.red)
+    
+    // 나머지 행은 비워두거나 최소한의 정보만 표시
